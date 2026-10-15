@@ -1,0 +1,10 @@
+*
+!Dockerfile
+!requirements-service.txt
+!server.py
+!static/
+!static/**
+!service/
+!service/**
+**/__pycache__/
+**/test_*.py

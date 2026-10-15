@@ -1,0 +1,4 @@
+-r requirements-service.txt
+pytest==9.1.1
+moto[dynamodb]==5.2.3
+cfn-lint==1.57.1

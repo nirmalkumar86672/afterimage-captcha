@@ -1,0 +1,512 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "Afterimage private beta API, Mumbai deployment target. Existing VPC/subnets and ACM certificate required.",
+  "Parameters": {
+    "ImageUri": {
+      "Type": "String"
+    },
+    "VpcId": {
+      "Type": "AWS::EC2::VPC::Id"
+    },
+    "PublicSubnets": {
+      "Type": "List<AWS::EC2::Subnet::Id>",
+      "Description": "Two public subnets in different AZs for the ALB"
+    },
+    "TaskSubnets": {
+      "Type": "List<AWS::EC2::Subnet::Id>",
+      "Description": "Private subnets with NAT/endpoints; or public subnets with AssignPublicIp ENABLED"
+    },
+    "AssignPublicIp": {
+      "Type": "String",
+      "Default": "DISABLED",
+      "AllowedValues": [
+        "ENABLED",
+        "DISABLED"
+      ]
+    },
+    "CertificateArn": {
+      "Type": "String",
+      "Description": "Validated ACM certificate in ap-south-1 for your service domain"
+    }
+  },
+  "Resources": {
+    "Table": {
+      "Type": "AWS::DynamoDB::Table",
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain",
+      "Properties": {
+        "BillingMode": "PAY_PER_REQUEST",
+        "AttributeDefinitions": [
+          {
+            "AttributeName": "pk",
+            "AttributeType": "S"
+          }
+        ],
+        "KeySchema": [
+          {
+            "AttributeName": "pk",
+            "KeyType": "HASH"
+          }
+        ],
+        "TimeToLiveSpecification": {
+          "AttributeName": "expires",
+          "Enabled": true
+        },
+        "PointInTimeRecoverySpecification": {
+          "PointInTimeRecoveryEnabled": true
+        },
+        "SSESpecification": {
+          "SSEEnabled": true
+        }
+      }
+    },
+    "Logs": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "RetentionInDays": 14
+      }
+    },
+    "ExecutionRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "ecs-tasks.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "ManagedPolicyArns": [
+          "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+        ]
+      }
+    },
+    "TaskRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "ecs-tasks.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "CaptchaState",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "dynamodb:GetItem",
+                    "dynamodb:PutItem",
+                    "dynamodb:DeleteItem",
+                    "dynamodb:UpdateItem"
+                  ],
+                  "Resource": {
+                    "Fn::GetAtt": [
+                      "Table",
+                      "Arn"
+                    ]
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "LoadBalancerSG": {
+      "Type": "AWS::EC2::SecurityGroup",
+      "Properties": {
+        "GroupDescription": "Public HTTPS and HTTP redirect",
+        "VpcId": {
+          "Ref": "VpcId"
+        },
+        "SecurityGroupIngress": [
+          {
+            "IpProtocol": "tcp",
+            "FromPort": 80,
+            "ToPort": 80,
+            "CidrIp": "0.0.0.0/0"
+          },
+          {
+            "IpProtocol": "tcp",
+            "FromPort": 443,
+            "ToPort": 443,
+            "CidrIp": "0.0.0.0/0"
+          }
+        ]
+      }
+    },
+    "TaskSG": {
+      "Type": "AWS::EC2::SecurityGroup",
+      "Properties": {
+        "GroupDescription": "Only ALB can reach API tasks",
+        "VpcId": {
+          "Ref": "VpcId"
+        },
+        "SecurityGroupIngress": [
+          {
+            "IpProtocol": "tcp",
+            "FromPort": 8080,
+            "ToPort": 8080,
+            "SourceSecurityGroupId": {
+              "Ref": "LoadBalancerSG"
+            }
+          }
+        ]
+      }
+    },
+    "LoadBalancer": {
+      "Type": "AWS::ElasticLoadBalancingV2::LoadBalancer",
+      "Properties": {
+        "Scheme": "internet-facing",
+        "Type": "application",
+        "Subnets": {
+          "Ref": "PublicSubnets"
+        },
+        "SecurityGroups": [
+          {
+            "Ref": "LoadBalancerSG"
+          }
+        ]
+      }
+    },
+    "TargetGroup": {
+      "Type": "AWS::ElasticLoadBalancingV2::TargetGroup",
+      "Properties": {
+        "VpcId": {
+          "Ref": "VpcId"
+        },
+        "Port": 8080,
+        "Protocol": "HTTP",
+        "TargetType": "ip",
+        "HealthCheckPath": "/healthz",
+        "Matcher": {
+          "HttpCode": "200"
+        },
+        "TargetGroupAttributes": [
+          {
+            "Key": "deregistration_delay.timeout_seconds",
+            "Value": "30"
+          }
+        ]
+      }
+    },
+    "HTTPS": {
+      "Type": "AWS::ElasticLoadBalancingV2::Listener",
+      "Properties": {
+        "LoadBalancerArn": {
+          "Ref": "LoadBalancer"
+        },
+        "Port": 443,
+        "Protocol": "HTTPS",
+        "Certificates": [
+          {
+            "CertificateArn": {
+              "Ref": "CertificateArn"
+            }
+          }
+        ],
+        "SslPolicy": "ELBSecurityPolicy-TLS13-1-2-2021-06",
+        "DefaultActions": [
+          {
+            "Type": "forward",
+            "TargetGroupArn": {
+              "Ref": "TargetGroup"
+            }
+          }
+        ]
+      }
+    },
+    "HTTP": {
+      "Type": "AWS::ElasticLoadBalancingV2::Listener",
+      "Properties": {
+        "LoadBalancerArn": {
+          "Ref": "LoadBalancer"
+        },
+        "Port": 80,
+        "Protocol": "HTTP",
+        "DefaultActions": [
+          {
+            "Type": "redirect",
+            "RedirectConfig": {
+              "Protocol": "HTTPS",
+              "Port": "443",
+              "StatusCode": "HTTP_301"
+            }
+          }
+        ]
+      }
+    },
+    "Cluster": {
+      "Type": "AWS::ECS::Cluster"
+    },
+    "Task": {
+      "Type": "AWS::ECS::TaskDefinition",
+      "Properties": {
+        "Cpu": "1024",
+        "Memory": "2048",
+        "NetworkMode": "awsvpc",
+        "RequiresCompatibilities": [
+          "FARGATE"
+        ],
+        "ExecutionRoleArn": {
+          "Fn::GetAtt": [
+            "ExecutionRole",
+            "Arn"
+          ]
+        },
+        "TaskRoleArn": {
+          "Fn::GetAtt": [
+            "TaskRole",
+            "Arn"
+          ]
+        },
+        "RuntimePlatform": {
+          "CpuArchitecture": "X86_64",
+          "OperatingSystemFamily": "LINUX"
+        },
+        "ContainerDefinitions": [
+          {
+            "Name": "api",
+            "Image": {
+              "Ref": "ImageUri"
+            },
+            "Essential": true,
+            "PortMappings": [
+              {
+                "ContainerPort": 8080
+              }
+            ],
+            "Environment": [
+              {
+                "Name": "APP_ENV",
+                "Value": "production"
+              },
+              {
+                "Name": "AWS_REGION",
+                "Value": {
+                  "Ref": "AWS::Region"
+                }
+              },
+              {
+                "Name": "DYNAMODB_TABLE",
+                "Value": {
+                  "Ref": "Table"
+                }
+              }
+            ],
+            "LogConfiguration": {
+              "LogDriver": "awslogs",
+              "Options": {
+                "awslogs-group": {
+                  "Ref": "Logs"
+                },
+                "awslogs-region": {
+                  "Ref": "AWS::Region"
+                },
+                "awslogs-stream-prefix": "api"
+              }
+            }
+          }
+        ]
+      }
+    },
+    "Service": {
+      "Type": "AWS::ECS::Service",
+      "DependsOn": [
+        "HTTPS"
+      ],
+      "Properties": {
+        "Cluster": {
+          "Ref": "Cluster"
+        },
+        "TaskDefinition": {
+          "Ref": "Task"
+        },
+        "DesiredCount": 1,
+        "LaunchType": "FARGATE",
+        "HealthCheckGracePeriodSeconds": 60,
+        "DeploymentConfiguration": {
+          "DeploymentCircuitBreaker": {
+            "Enable": true,
+            "Rollback": true
+          }
+        },
+        "NetworkConfiguration": {
+          "AwsvpcConfiguration": {
+            "Subnets": {
+              "Ref": "TaskSubnets"
+            },
+            "AssignPublicIp": {
+              "Ref": "AssignPublicIp"
+            },
+            "SecurityGroups": [
+              {
+                "Ref": "TaskSG"
+              }
+            ]
+          }
+        },
+        "LoadBalancers": [
+          {
+            "ContainerName": "api",
+            "ContainerPort": 8080,
+            "TargetGroupArn": {
+              "Ref": "TargetGroup"
+            }
+          }
+        ]
+      }
+    },
+    "ScaleTarget": {
+      "Type": "AWS::ApplicationAutoScaling::ScalableTarget",
+      "Properties": {
+        "MaxCapacity": 4,
+        "MinCapacity": 1,
+        "ResourceId": {
+          "Fn::Sub": "service/${Cluster}/${Service.Name}"
+        },
+        "ScalableDimension": "ecs:service:DesiredCount",
+        "ServiceNamespace": "ecs",
+        "RoleARN": {
+          "Fn::Sub": "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-service-role/ecs.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_ECSService"
+        }
+      }
+    },
+    "ScalePolicy": {
+      "Type": "AWS::ApplicationAutoScaling::ScalingPolicy",
+      "Properties": {
+        "PolicyName": "captcha-cpu",
+        "PolicyType": "TargetTrackingScaling",
+        "ScalingTargetId": {
+          "Ref": "ScaleTarget"
+        },
+        "TargetTrackingScalingPolicyConfiguration": {
+          "TargetValue": 60,
+          "ScaleInCooldown": 120,
+          "ScaleOutCooldown": 30,
+          "PredefinedMetricSpecification": {
+            "PredefinedMetricType": "ECSServiceAverageCPUUtilization"
+          }
+        }
+      }
+    },
+    "WebACL": {
+      "Type": "AWS::WAFv2::WebACL",
+      "Properties": {
+        "Scope": "REGIONAL",
+        "DefaultAction": {
+          "Allow": {}
+        },
+        "VisibilityConfig": {
+          "CloudWatchMetricsEnabled": true,
+          "SampledRequestsEnabled": false,
+          "MetricName": "captcha-api"
+        },
+        "Rules": [
+          {
+            "Name": "IPRateLimit",
+            "Priority": 0,
+            "Action": {
+              "Block": {}
+            },
+            "VisibilityConfig": {
+              "CloudWatchMetricsEnabled": true,
+              "SampledRequestsEnabled": false,
+              "MetricName": "captcha-rate"
+            },
+            "Statement": {
+              "RateBasedStatement": {
+                "Limit": 300,
+                "AggregateKeyType": "IP",
+                "EvaluationWindowSec": 300
+              }
+            }
+          }
+        ]
+      }
+    },
+    "WafAssociation": {
+      "Type": "AWS::WAFv2::WebACLAssociation",
+      "Properties": {
+        "ResourceArn": {
+          "Ref": "LoadBalancer"
+        },
+        "WebACLArn": {
+          "Fn::GetAtt": [
+            "WebACL",
+            "Arn"
+          ]
+        }
+      }
+    },
+    "ServerErrors": {
+      "Type": "AWS::CloudWatch::Alarm",
+      "Properties": {
+        "AlarmDescription": "Check service logs when API 5xx errors increase",
+        "Namespace": "AWS/ApplicationELB",
+        "MetricName": "HTTPCode_Target_5XX_Count",
+        "Dimensions": [
+          {
+            "Name": "LoadBalancer",
+            "Value": {
+              "Fn::GetAtt": [
+                "LoadBalancer",
+                "LoadBalancerFullName"
+              ]
+            }
+          }
+        ],
+        "Statistic": "Sum",
+        "Period": 60,
+        "EvaluationPeriods": 2,
+        "Threshold": 5,
+        "ComparisonOperator": "GreaterThanThreshold",
+        "TreatMissingData": "notBreaching"
+      }
+    }
+  },
+  "Outputs": {
+    "LoadBalancerDNS": {
+      "Value": {
+        "Fn::GetAtt": [
+          "LoadBalancer",
+          "DNSName"
+        ]
+      }
+    },
+    "TableName": {
+      "Value": {
+        "Ref": "Table"
+      }
+    },
+    "Cluster": {
+      "Value": {
+        "Ref": "Cluster"
+      }
+    },
+    "ServiceName": {
+      "Value": {
+        "Fn::GetAtt": [
+          "Service",
+          "Name"
+        ]
+      }
+    }
+  }
+}
